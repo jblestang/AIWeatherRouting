@@ -43,12 +43,12 @@ pub struct IsochroneRouter {
     pub destination: Coordinate,
     /// Time step in seconds
     pub time_step: f64, 
-    pub sector_resolution: f32,
+    pub grid_precision: f64,
 }
 
 impl IsochroneRouter {
     pub fn new(start: Coordinate, destination: Coordinate, time_step: f64) -> Self {
-        Self { start, destination, time_step, sector_resolution: 0.25 }
+        Self { start, destination, time_step, grid_precision: 400.0 }
     }
 
     /// Helper to calculate the bearing between two coordinates
@@ -113,8 +113,8 @@ impl IsochroneRouter {
         info!("Expanding isochrone front for {} points", current_front.len());
         
         // Define the search fan (widened to allow for tacking/wearing)
-        let num_headings = 151;
-        let max_angle = 150.0; // Sweep from -150 to +150 degrees
+        let num_headings = 360;
+        let max_angle = 180.0; // Sweep from -180 to +180 degrees
         let angle_step = (max_angle * 2.0) / (num_headings as f32 - 1.0);
 
         let next_front_candidates: Vec<BoatState> = current_front.par_iter().flat_map(|state| {
@@ -170,28 +170,37 @@ impl IsochroneRouter {
             local_candidates
         }).collect();
         
-        // Prune the front using angular sectors to keep only the external envelope
-        // We divide the space around the 'start' into discrete angular sectors
-        let mut sectors: std::collections::HashMap<i32, BoatState> = std::collections::HashMap::new();
+        // --- Pass 1: Density Pruning (Grid Bucketing) ---
+        let mut grid: std::collections::HashMap<(i32, i32), BoatState> = std::collections::HashMap::new();
+        let precision = self.grid_precision;
         
         for state in next_front_candidates {
-            let bearing = Self::calculate_bearing(&self.start, &state.position);
-            // Quantize bearing into sector index
-            let sector_idx = (bearing / self.sector_resolution).round() as i32;
+            let grid_x = (state.position.lon * precision).round() as i32;
+            let grid_y = (state.position.lat * precision).round() as i32;
             
-            let dist_from_start = Self::calculate_distance(&self.start, &state.position);
+            let dist_to_dest = Self::calculate_distance(&state.position, &self.destination);
             
-            sectors.entry(sector_idx)
+            grid.entry((grid_x, grid_y))
                 .and_modify(|existing| {
-                    if dist_from_start > Self::calculate_distance(&self.start, &existing.position) {
+                    if dist_to_dest < Self::calculate_distance(&existing.position, &self.destination) {
                         *existing = state.clone();
                     }
                 })
                 .or_insert(state);
         }
 
-        let next_front: Vec<_> = sectors.into_values().collect();
-        info!("Pruned front down to {} optimal points", next_front.len());
+        // --- Pass 2: Boundary Detection (Keep only the "Frontier") ---
+        // A point is on the frontier if it has at least one empty neighbor in the grid
+        let next_front: Vec<BoatState> = grid.iter()
+            .filter(|((x, y), _)| {
+                // Check 4-connected neighbors
+                let neighbors = [(x + 1, *y), (x - 1, *y), (*x, y + 1), (*x, y - 1)];
+                neighbors.iter().any(|neighbor| !grid.contains_key(neighbor))
+            })
+            .map(|(_, state)| state.clone())
+            .collect();
+
+        info!("Pruned front down to {} optimal frontier points", next_front.len());
         
         next_front
     }
