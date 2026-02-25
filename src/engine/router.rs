@@ -4,7 +4,8 @@ use crate::engine::mask::LandMask;
 use bevy::prelude::*;
 use rayon::prelude::*;
 use log::info;
-use geo::{Polygon, LineString, Coord, BooleanOps};
+use geo_types_06 as gt06;
+use geo_booleanop::boolean::BooleanOp;
 
 #[derive(Resource)]
 pub struct RoutingState {
@@ -155,16 +156,16 @@ impl IsochroneRouter {
         }).collect();
 
         // --- Pass 1: Convert Fans to Polygons ---
-        let mut polygons: Vec<Polygon<f64>> = current_front.iter().zip(expansion_fans.iter())
+        let mut polygons: Vec<gt06::Polygon<f64>> = current_front.iter().zip(expansion_fans.iter())
             .filter(|(_, fan)| fan.len() >= 2) // Need at least 2 points to form an area with parent
             .map(|(parent, fan)| {
                 let mut coords = Vec::with_capacity(fan.len() + 2);
-                coords.push(Coord { x: parent.position.lon, y: parent.position.lat });
+                coords.push(gt06::Coordinate { x: parent.position.lon, y: parent.position.lat });
                 for candidate in fan {
-                    coords.push(Coord { x: candidate.position.lon, y: candidate.position.lat });
+                    coords.push(gt06::Coordinate { x: candidate.position.lon, y: candidate.position.lat });
                 }
-                coords.push(Coord { x: parent.position.lon, y: parent.position.lat });
-                Polygon::new(LineString::new(coords), vec![])
+                coords.push(gt06::Coordinate { x: parent.position.lon, y: parent.position.lat });
+                gt06::Polygon::new(gt06::LineString(coords), vec![])
             })
             .collect();
 
@@ -178,7 +179,7 @@ impl IsochroneRouter {
             let mut next_level = Vec::with_capacity((polygons.len() + 1) / 2);
             for chunk in polygons.chunks(2) {
                 if chunk.len() == 2 {
-                    // Union the two polygons
+                    // Union the two polygons using Martinez-Rueda algorithm
                     let unioned = chunk[0].union(&chunk[1]);
                     next_level.extend(unioned.0.into_iter());
                 } else {
@@ -200,7 +201,7 @@ impl IsochroneRouter {
             let exterior = poly.exterior();
             // Resample the exterior to maintain point density
             // We'll take points roughly at the grid_precision resolution
-            let coords = exterior.0.as_slice();
+            let coords = &exterior.0;
             if coords.len() < 2 { continue; }
 
             for i in 0..coords.len()-1 {
