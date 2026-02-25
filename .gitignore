@@ -1,0 +1,6 @@
+/target
+/data/*.grib2
+/data/tiles/
+*.pyc
+__pycache__/
+.DS_Store

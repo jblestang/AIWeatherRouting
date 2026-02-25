@@ -1,0 +1,19 @@
+[package]
+name = "AIWeatherRouting"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.15.0"
+bevy_egui = "0.32.0"
+chrono = { version = "0.4.44", features = ["serde"] }
+eccodes = "0.14.0"
+env_logger = "0.11.9"
+futures-lite = "2.6.1"
+image = "0.25.9"
+log = "0.4.29"
+rayon = "1.11.0"
+reqwest = { version = "0.13.2", features = ["blocking"] }
+roaring = "0.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+xz2 = "0.1.7"
