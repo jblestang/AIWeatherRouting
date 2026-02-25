@@ -17,3 +17,5 @@ reqwest = { version = "0.13.2", features = ["blocking"] }
 roaring = "0.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 xz2 = "0.1.7"
+geo = "0.29.3"
+geo-booleanop = "0.3.2"

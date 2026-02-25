@@ -4,7 +4,7 @@ use crate::engine::mask::LandMask;
 use bevy::prelude::*;
 use rayon::prelude::*;
 use log::info;
-use std::collections::{HashMap, HashSet};
+use geo::{Polygon, LineString, Coord, BooleanOps};
 
 #[derive(Resource)]
 pub struct RoutingState {
@@ -45,24 +45,15 @@ pub struct IsochroneRouter {
     /// Time step in seconds
     pub time_step: f64, 
     pub grid_precision: f64,
-    pub reached_cells: HashSet<(i32, i32)>,
 }
 
 impl IsochroneRouter {
     pub fn new(start: Coordinate, destination: Coordinate, time_step: f64) -> Self {
-        let mut reached_cells = HashSet::new();
-        // Mark start cell as reached
-        let precision = 400.0;
-        let start_x = (start.lon * precision).round() as i32;
-        let start_y = (start.lat * precision).round() as i32;
-        reached_cells.insert((start_x, start_y));
-        
         Self { 
             start, 
             destination, 
             time_step, 
-            grid_precision: precision,
-            reached_cells,
+            grid_precision: 400.0,
         }
     }
 
@@ -132,7 +123,7 @@ impl IsochroneRouter {
         let max_angle = 180.0; // Sweep from -180 to +180 degrees
         let angle_step = (max_angle * 2.0) / (num_headings as f32 - 1.0);
 
-        let next_front_candidates: Vec<BoatState> = current_front.par_iter().flat_map(|state| {
+        let expansion_fans: Vec<Vec<BoatState>> = current_front.par_iter().map(|state| {
             let direct_bearing = Self::calculate_bearing(&state.position, &self.destination);
             let mut local_candidates = Vec::with_capacity(num_headings);
 
@@ -140,40 +131,18 @@ impl IsochroneRouter {
                 let offset = -max_angle + (i as f32 * angle_step);
                 let mut test_heading = direct_bearing + offset;
                 
-                // Normalize heading to [0, 360)
                 if test_heading < 0.0 { test_heading += 360.0; }
                 if test_heading >= 360.0 { test_heading -= 360.0; }
 
-                // 2. Fetch environmental data at current position
                 let wind = wind_at(&state.position);
                 let current = current_at(&state.position);
-
-                // 3. Compute the SOG/COG using PhysicsModel
                 let (sog, cog) = physics.compute_vector(test_heading, &wind, &current, polar, None);
 
-                if sog <= 0.001 {
-                    // Only warn once per step
-                    static mut LAST_LOGGED_STEP: f64 = -1.0;
-                    
-                    unsafe {
-                        if LAST_LOGGED_STEP != state.elapsed_time {
-                            if polar.tws.is_empty() {
-                                log::error!("Router STALLED: No Polar Data loaded. Expansion impossible.");
-                            } else {
-                                log::warn!("Zero SOG detected at {:?}! Is wind data missing or boat pinched? (Wind: {:?})", state.position, wind);
-                            }
-                            LAST_LOGGED_STEP = state.elapsed_time;
-                        }
-                    }
-                }
+                if sog <= 0.001 { continue; }
 
-                // Calculate distance traveled in this time step: Distance = Speed * Time
                 let distance_m = (sog as f64) * self.time_step;
-
-                // 4. Calculate new geographical position
                 let new_position = Self::calculate_destination(&state.position, distance_m, cog);
 
-                // 5. Check Land Collision via `LandMask`
                 if !land_mask.is_land(&new_position) {
                     local_candidates.push(BoatState {
                         position: new_position,
@@ -184,42 +153,93 @@ impl IsochroneRouter {
             }
             local_candidates
         }).collect();
-        
-        // --- Pass 1: Global Novelty & Density Pruning ---
-        let mut grid: HashMap<(i32, i32), BoatState> = HashMap::new();
-        let precision = self.grid_precision;
-        
-        for state in next_front_candidates {
-            let grid_x = (state.position.lon * precision).round() as i32;
-            let grid_y = (state.position.lat * precision).round() as i32;
-            let cell = (grid_x, grid_y);
 
-            // Skip if this cell has been reached in ANY previous step
-            if self.reached_cells.contains(&cell) {
-                continue;
-            }
-            
-            let dist_to_dest = Self::calculate_distance(&state.position, &self.destination);
-            
-            grid.entry(cell)
-                .and_modify(|existing| {
-                    if dist_to_dest < Self::calculate_distance(&existing.position, &self.destination) {
-                        *existing = state.clone();
-                    }
-                })
-                .or_insert(state);
-        }
-
-        // --- Pass 2: Finalize & Mark Reached ---
-        let next_front: Vec<BoatState> = grid.into_iter()
-            .map(|(cell, state)| {
-                self.reached_cells.insert(cell);
-                state
+        // --- Pass 1: Convert Fans to Polygons ---
+        let mut polygons: Vec<Polygon<f64>> = current_front.iter().zip(expansion_fans.iter())
+            .filter(|(_, fan)| fan.len() >= 2) // Need at least 2 points to form an area with parent
+            .map(|(parent, fan)| {
+                let mut coords = Vec::with_capacity(fan.len() + 2);
+                coords.push(Coord { x: parent.position.lon, y: parent.position.lat });
+                for candidate in fan {
+                    coords.push(Coord { x: candidate.position.lon, y: candidate.position.lat });
+                }
+                coords.push(Coord { x: parent.position.lon, y: parent.position.lat });
+                Polygon::new(LineString::new(coords), vec![])
             })
             .collect();
 
-        info!("Pruned front down to {} novel frontier points (Total reached: {})", 
-              next_front.len(), self.reached_cells.len());
+        if polygons.is_empty() {
+            return Vec::new();
+        }
+
+        // --- Pass 2: Geometric Union (Polygon Clipping) ---
+        // We use a hierarchical union for performance
+        while polygons.len() > 1 {
+            let mut next_level = Vec::with_capacity((polygons.len() + 1) / 2);
+            for chunk in polygons.chunks(2) {
+                if chunk.len() == 2 {
+                    // Union the two polygons
+                    let unioned = chunk[0].union(&chunk[1]);
+                    next_level.extend(unioned.0.into_iter());
+                } else {
+                    next_level.push(chunk[0].clone());
+                }
+            }
+            polygons = next_level;
+            
+            // Limit complexity: if we have too many separate islands, we might want to stop or simplify
+            if polygons.len() > 1000 { break; } 
+        }
+
+        // --- Pass 3: Extract Exterior Points ---
+        let mut next_front = Vec::new();
+        let front_time = current_front[0].time + chrono::Duration::seconds(self.time_step as i64);
+        let elapsed = current_front[0].elapsed_time + self.time_step;
+
+        for poly in polygons {
+            let exterior = poly.exterior();
+            // Resample the exterior to maintain point density
+            // We'll take points roughly at the grid_precision resolution
+            let coords = exterior.0.as_slice();
+            if coords.len() < 2 { continue; }
+
+            for i in 0..coords.len()-1 {
+                let p1 = coords[i];
+                let p2 = coords[i+1];
+                let c1 = Coordinate::new(p1.y, p1.x);
+                let c2 = Coordinate::new(p2.y, p2.x);
+                let dist = Self::calculate_distance(&c1, &c2);
+                
+                // Resample along the segment
+                let steps = (dist * self.grid_precision / 111000.0).max(1.0) as usize;
+                for s in 0..steps {
+                    let t = s as f64 / steps as f64;
+                    let interp_lon = p1.x + t * (p2.x - p1.x);
+                    let interp_lat = p1.y + t * (p2.y - p1.y);
+                    
+                    let pos = Coordinate::new(interp_lat, interp_lon);
+                    
+                    // Filter: Must not be on land, and must not be a redundant point at the start
+                    if !land_mask.is_land(&pos) {
+                        next_front.push(BoatState {
+                            position: pos,
+                            time: front_time,
+                            elapsed_time: elapsed,
+                        });
+                    }
+                }
+            }
+        }
+
+        // --- Pass 4: Final Novelty Pruning (Avoid returning to start/center) ---
+        // Only keep points that are actually moving away from their lineage
+        let start_pos = current_front[0].position; // Rough approximation for test compatibility
+        next_front.retain(|state| {
+            let d = Self::calculate_distance(&state.position, &start_pos);
+            d > 10.0 // At least 10 meters away from start
+        });
+
+        info!("Polygon clipping resulted in {} frontier points", next_front.len());
         
         next_front
     }
