@@ -4,6 +4,7 @@ use crate::engine::mask::LandMask;
 use bevy::prelude::*;
 use rayon::prelude::*;
 use log::info;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Resource)]
 pub struct RoutingState {
@@ -44,11 +45,25 @@ pub struct IsochroneRouter {
     /// Time step in seconds
     pub time_step: f64, 
     pub grid_precision: f64,
+    pub reached_cells: HashSet<(i32, i32)>,
 }
 
 impl IsochroneRouter {
     pub fn new(start: Coordinate, destination: Coordinate, time_step: f64) -> Self {
-        Self { start, destination, time_step, grid_precision: 400.0 }
+        let mut reached_cells = HashSet::new();
+        // Mark start cell as reached
+        let precision = 400.0;
+        let start_x = (start.lon * precision).round() as i32;
+        let start_y = (start.lat * precision).round() as i32;
+        reached_cells.insert((start_x, start_y));
+        
+        Self { 
+            start, 
+            destination, 
+            time_step, 
+            grid_precision: precision,
+            reached_cells,
+        }
     }
 
     /// Helper to calculate the bearing between two coordinates
@@ -170,17 +185,23 @@ impl IsochroneRouter {
             local_candidates
         }).collect();
         
-        // --- Pass 1: Density Pruning (Grid Bucketing) ---
-        let mut grid: std::collections::HashMap<(i32, i32), BoatState> = std::collections::HashMap::new();
+        // --- Pass 1: Global Novelty & Density Pruning ---
+        let mut grid: HashMap<(i32, i32), BoatState> = HashMap::new();
         let precision = self.grid_precision;
         
         for state in next_front_candidates {
             let grid_x = (state.position.lon * precision).round() as i32;
             let grid_y = (state.position.lat * precision).round() as i32;
+            let cell = (grid_x, grid_y);
+
+            // Skip if this cell has been reached in ANY previous step
+            if self.reached_cells.contains(&cell) {
+                continue;
+            }
             
             let dist_to_dest = Self::calculate_distance(&state.position, &self.destination);
             
-            grid.entry((grid_x, grid_y))
+            grid.entry(cell)
                 .and_modify(|existing| {
                     if dist_to_dest < Self::calculate_distance(&existing.position, &self.destination) {
                         *existing = state.clone();
@@ -189,18 +210,16 @@ impl IsochroneRouter {
                 .or_insert(state);
         }
 
-        // --- Pass 2: Boundary Detection (Keep only the "Frontier") ---
-        // A point is on the frontier if it has at least one empty neighbor in the grid
-        let next_front: Vec<BoatState> = grid.iter()
-            .filter(|((x, y), _)| {
-                // Check 4-connected neighbors
-                let neighbors = [(x + 1, *y), (x - 1, *y), (*x, y + 1), (*x, y - 1)];
-                neighbors.iter().any(|neighbor| !grid.contains_key(neighbor))
+        // --- Pass 2: Finalize & Mark Reached ---
+        let next_front: Vec<BoatState> = grid.into_iter()
+            .map(|(cell, state)| {
+                self.reached_cells.insert(cell);
+                state
             })
-            .map(|(_, state)| state.clone())
             .collect();
 
-        info!("Pruned front down to {} optimal frontier points", next_front.len());
+        info!("Pruned front down to {} novel frontier points (Total reached: {})", 
+              next_front.len(), self.reached_cells.len());
         
         next_front
     }
@@ -321,9 +340,8 @@ mod tests {
             |_| CurrentData { u: 0.0, v: 0.0 }
         );
 
-        // Should collapse to 1 point (the start point)
-        assert_eq!(next_front.len(), 1);
-        assert!((next_front[0].position.lat - start.lat).abs() < 1e-10);
+        // Should return 0 points because no NEW cells were reached (start cell is already marked reached)
+        assert_eq!(next_front.len(), 0);
     }
 
     #[test]
