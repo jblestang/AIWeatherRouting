@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use log::info;
 use geo_types_06 as gt06;
 use geo_booleanop::boolean::BooleanOp;
-use geo::{Polygon, LineString, Coord, Point, ConvexHull, MultiPoint};
+use geo::{Point, ConvexHull, MultiPoint, MultiPolygon};
 
 #[derive(Resource)]
 pub struct RoutingState {
@@ -172,11 +172,19 @@ impl IsochroneRouter {
                 let hull = mp.convex_hull();
                 
                 // Convert back-conversion to legacy gt06 types for Martinez-Rueda
+                // Round coordinates to mitigate floating point artifacts and dedupe
                 let hull_exterior = hull.exterior();
-                let gt06_coords: Vec<gt06::Coordinate<f64>> = hull_exterior.0.iter()
-                    .map(|c| gt06::Coordinate { x: c.x, y: c.y })
+                let mut gt06_coords: Vec<gt06::Coordinate<f64>> = hull_exterior.0.iter()
+                    .map(|c| {
+                        let x = (c.x * 1e7).round() / 1e7;
+                        let y = (c.y * 1e7).round() / 1e7;
+                        gt06::Coordinate { x, y }
+                    })
                     .collect();
                 
+                // Deduplicate consecutive points to remove zero-length segments
+                gt06_coords.dedup_by(|a, b| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9);
+
                 gt06::Polygon::new(gt06::LineString(gt06_coords), vec![])
             })
             .collect();
@@ -186,30 +194,42 @@ impl IsochroneRouter {
         }
 
         // --- Pass 2: Geometric Union (Polygon Clipping) ---
-        // We use a hierarchical union for performance
-        while polygons.len() > 1 {
-            let mut next_level = Vec::with_capacity((polygons.len() + 1) / 2);
-            for chunk in polygons.chunks(2) {
+        // Use a hierarchical union for performance and reliability.
+        // We use MultiPolygon to ensure the object count always reduces, even if polygons stay disjoint.
+        let mut multi_polygons: Vec<gt06::MultiPolygon<f64>> = polygons.into_iter()
+            .map(|p| gt06::MultiPolygon(vec![p]))
+            .collect();
+
+        if multi_polygons.is_empty() {
+            return Vec::new();
+        }
+
+        let mut iteration = 0;
+        while multi_polygons.len() > 1 {
+            iteration += 1;
+            info!("Union iteration {}: {} groups", iteration, multi_polygons.len());
+            
+            let mut next_level = Vec::with_capacity((multi_polygons.len() + 1) / 2);
+            for chunk in multi_polygons.chunks(2) {
                 if chunk.len() == 2 {
-                    // Union the two polygons using Martinez-Rueda algorithm
-                    let unioned = chunk[0].union(&chunk[1]);
-                    next_level.extend(unioned.0.into_iter());
+                    // Union the two MultiPolygons using Martinez-Rueda algorithm
+                    next_level.push(chunk[0].union(&chunk[1]));
                 } else {
                     next_level.push(chunk[0].clone());
                 }
             }
-            polygons = next_level;
+            multi_polygons = next_level;
             
-            // Limit complexity: if we have too many separate islands, we might want to stop or simplify
-            if polygons.len() > 1000 { break; } 
+            if iteration > 20 { break; } 
         }
 
         // --- Pass 3: Extract Exterior Points ---
+        let final_multi = multi_polygons.pop().unwrap();
         let mut next_front = Vec::new();
         let front_time = current_front[0].time + chrono::Duration::seconds(self.time_step as i64);
         let elapsed = current_front[0].elapsed_time + self.time_step;
 
-        for poly in polygons {
+        for poly in final_multi.0 {
             let exterior = poly.exterior();
             // Resample the exterior to maintain point density
             // We'll take points roughly at the grid_precision resolution
