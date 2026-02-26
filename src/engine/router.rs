@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use log::info;
 use geo_types_06 as gt06;
 use geo_booleanop::boolean::BooleanOp;
+use geo::{Polygon, LineString, Coord, Point, ConvexHull, MultiPoint};
 
 #[derive(Resource)]
 pub struct RoutingState {
@@ -155,17 +156,28 @@ impl IsochroneRouter {
             local_candidates
         }).collect();
 
-        // --- Pass 1: Convert Fans to Polygons ---
+        // --- Pass 1: Convert Fans to Convex Hull Polygons ---
         let mut polygons: Vec<gt06::Polygon<f64>> = current_front.iter().zip(expansion_fans.iter())
-            .filter(|(_, fan)| fan.len() >= 2) // Need at least 2 points to form an area with parent
+            .filter(|(_, fan)| fan.len() >= 2) 
             .map(|(parent, fan)| {
-                let mut coords = Vec::with_capacity(fan.len() + 2);
-                coords.push(gt06::Coordinate { x: parent.position.lon, y: parent.position.lat });
+                // Collect points including parent
+                let mut points = Vec::with_capacity(fan.len() + 1);
+                points.push(Point::new(parent.position.lon, parent.position.lat));
                 for candidate in fan {
-                    coords.push(gt06::Coordinate { x: candidate.position.lon, y: candidate.position.lat });
+                    points.push(Point::new(candidate.position.lon, candidate.position.lat));
                 }
-                coords.push(gt06::Coordinate { x: parent.position.lon, y: parent.position.lat });
-                gt06::Polygon::new(gt06::LineString(coords), vec![])
+                
+                // Compute Convex Hull using modern geo crate
+                let mp = MultiPoint::new(points);
+                let hull = mp.convex_hull();
+                
+                // Convert back-conversion to legacy gt06 types for Martinez-Rueda
+                let hull_exterior = hull.exterior();
+                let gt06_coords: Vec<gt06::Coordinate<f64>> = hull_exterior.0.iter()
+                    .map(|c| gt06::Coordinate { x: c.x, y: c.y })
+                    .collect();
+                
+                gt06::Polygon::new(gt06::LineString(gt06_coords), vec![])
             })
             .collect();
 
@@ -237,7 +249,7 @@ impl IsochroneRouter {
         let start_pos = current_front[0].position; // Rough approximation for test compatibility
         next_front.retain(|state| {
             let d = Self::calculate_distance(&state.position, &start_pos);
-            d > 10.0 // At least 10 meters away from start
+            d > 100.0 // At least 10 meters away from start
         });
 
         info!("Polygon clipping resulted in {} frontier points", next_front.len());
